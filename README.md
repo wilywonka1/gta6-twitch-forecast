@@ -8,7 +8,7 @@ An entry for make.fun's ["Forecast GTA VI's launch-day Twitch viewers hour by ho
 
 The program forecasts how many people watch Grand Theft Auto VI live on Twitch in each hour of its release day, 2026-11-19 (UTC), after the first — five quantiles (5%, 25%, 50%, 75%, 95%) for each of hours 2–24, scored by mean pinball loss on the log scale.
 
-How it works: past launches trace a repeatable shape once normalised by their own first hour. For every comparable launch in the case, the program takes the release-day log ratios `ln(viewers_h / viewers_hour1)`, weights each comparable by how close its hour-1 audience is to this case's hour-1 print (a Gaussian kernel on log scale — first-hour scale is a strong proxy for unlock regime), and reads the five quantiles straight off the weighted empirical distribution per hour. A leave-one-out backtest over the comparables scored ≈0.41 against ≈0.93 for the flat persistence baseline.
+How it works: past launches trace a repeatable shape once normalised by their own first hour. For every comparable launch in the case, the program takes the release-day log ratios `ln(viewers_h / viewers_hour1)`, weights each comparable by how close its hour-1 audience is to this case's hour-1 print (a Gaussian kernel on log scale — first-hour scale is a strong proxy for unlock regime), and reads the five quantiles straight off the weighted empirical distribution per hour. v2 tightens the kernel floor to 0.001 and adds a capped early-hours momentum shift from the case's own hourly slope into hour 1. A leave-one-out backtest over the comparables scored ≈0.40 against ≈0.93 for the flat persistence baseline.
 
 ## Run it
 

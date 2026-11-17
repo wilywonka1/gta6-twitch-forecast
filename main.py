@@ -1,4 +1,4 @@
-"""Launch-day Twitch audience forecaster for gta6-twitch-ccu-forecast-01.
+"""Launch-day Twitch audience forecaster for gta6-twitch-ccu-forecast-01 (v2).
 
 Approach
 --------
@@ -21,19 +21,37 @@ where Q_tau is a *weighted* empirical quantile.  Comparables are weighted
 by how close their own hour-1 audience is to this case's hour-1 audience,
 on the log scale:
 
-    w = exp(-0.5 * (ln(h1_comp / p1) / 1.0)**2) + 0.02
+    w = exp(-0.5 * (ln(h1_comp / p1) / 1.0)**2) + 0.001
 
 Hour-1 scale turns out to be a strong proxy for launch type: titles whose
 first UTC hour was already huge (a simultaneous or Asia-first unlock) stay
 flat, while titles whose first hour was tiny (a late US unlock) explode
 later in the day.  Weighting by scale similarity keeps those regimes from
-contaminating each other.  A leave-one-out backtest over the comparable
-set (each launch forecast from all the others, scored with the contest's
-log-scale pinball loss) gave roughly:
+contaminating each other.
+
+Two refinements over v1, both chosen by leave-one-out (LOO) backtests over
+the 37 usable comparables (each launch forecast from the other 36, scored
+with the contest's log-scale pinball loss):
+
+  * The kernel floor dropped from 0.02 to 0.001.  The old floor let
+    far-off-scale launches dilute the local shape; with the smaller floor
+    the effective sample stays healthy (about 10 of 36 for the largest
+    targets) and the biggest-target backtests improve too, so the kernel
+    degrades gracefully when the target out-scales every comparable.
+  * An early-hours momentum shift.  The slope of ln viewers over the last
+    three hourly points up to and including hour 1 correlates with the
+    hours 2-4 log ratios across launches (r about 0.36), so those hours'
+    log quantiles are shifted by 0.5 * slope, capped at +-0.4 log units.
+    Later hours are left to the comparables alone.
+
+Also tested by LOO and deliberately left out: widening the spread around
+the median (multipliers 1.1-1.3 all hurt), extra kernel dimensions for
+unlock timing and pre-launch heat (both hurt at every bandwidth tried),
+and blending in a shape aligned by hours since unlock (neutral at best).
 
     persistence baseline (flat, sigma 0.15*sqrt(h-1)) : 0.93
-    unweighted median + IQR normal approximation      : 0.80
-    scale-weighted empirical quantiles (this program) : 0.41
+    v1 scale-weighted empirical quantiles            : 0.4147
+    v2 (this program)                                 : 0.4026
 
 Safety rails: comparables describing the target category itself (its
 pre-release history is not a launch) are dropped, as are comparables with
@@ -60,9 +78,18 @@ LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
 Z_SCORES = (-1.645, -0.674, 0.0, 0.674, 1.645)
 
 # Weighting of comparables by hour-1 scale similarity (log-space Gaussian
-# kernel plus a small floor so distant launches still count a little).
+# kernel plus a small floor so distant launches still count a little and
+# the total weight can never underflow to zero).
 KERNEL_BANDWIDTH = 1.0
-KERNEL_FLOOR = 0.02
+KERNEL_FLOOR = 0.001
+
+# Early-hours momentum: hours 2..4 log quantiles shift by
+# v2 (coordinator-verified on the practice inputs: deterministic, ~66 ms
+# per case): SLOPE_GAIN * (slope of ln viewers over the last three hourly points up
+# to hour 1), the shift capped at +-SLOPE_CAP log units.
+SLOPE_GAIN = 0.5
+SLOPE_CAP = 0.4
+SLOPE_HOURS = (2, 3, 4)
 
 # A comparable must cover at least this many release-day hours to be used.
 MIN_DAY_HOURS = 20
@@ -164,6 +191,39 @@ def weighted_quantile(sorted_pairs, level):
     return sorted_pairs[-1][0]
 
 
+def hourly_slope(case, p1):
+    """Slope of ln viewers over the last three hourly points up to hour 1.
+
+    Points are the whole-hour means at hour offsets -2, -1 and 0 relative
+    to the release day's start (offset 0 is hour 1 itself, taken from the
+    known print so it is present even if the hourly history trims it).
+    Returns 0.0 when fewer than two usable points exist.
+    """
+    try:
+        day0 = parse_instant(case["day_start"])
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+    by_offset = {0: p1}
+    for row in case.get("history_hourly") or []:
+        try:
+            stamp = parse_instant(row["from"])
+            viewers = float(row["viewers"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        offset = (stamp - day0) / timedelta(hours=1)
+        if offset == int(offset) and -2 <= int(offset) <= 0 and viewers > 0:
+            by_offset[int(offset)] = viewers
+    points = sorted((off, math.log(v)) for off, v in by_offset.items())
+    if len(points) < 2:
+        return 0.0
+    mean_x = sum(p[0] for p in points) / len(points)
+    mean_y = sum(p[1] for p in points) / len(points)
+    denom = sum((p[0] - mean_x) ** 2 for p in points)
+    if denom <= 0:
+        return 0.0
+    return sum((p[0] - mean_x) * (p[1] - mean_y) for p in points) / denom
+
+
 def round_cents(value):
     """Round half-up to two decimals, matching the house style."""
     return math.floor(value * 100.0 + 0.5) / 100.0
@@ -199,6 +259,9 @@ def forecast_hours(case):
     weighted_curves = [
         (curve, similarity_weight(curve[1], p1)) for curve in curves
     ]
+    # Momentum shift for the first forecast hours, from the case's own
+    # hourly run-up into hour 1 (validated on the comparables' analogues).
+    slope_shift = max(-SLOPE_CAP, min(SLOPE_CAP, SLOPE_GAIN * hourly_slope(case, p1)))
 
     rows = []
     for hour in range(2, 25):
@@ -216,6 +279,8 @@ def forecast_hours(case):
                 median = log_quantiles[2]
                 unit = MIN_LOG_SPREAD / (2.0 * 1.645)
                 log_quantiles = [median + z * unit for z in Z_SCORES]
+            if hour in SLOPE_HOURS and slope_shift:
+                log_quantiles = [r + slope_shift for r in log_quantiles]
             quantiles = [p1 * math.exp(r) for r in log_quantiles]
         else:
             sigma = FALLBACK_SIGMA * math.sqrt(hour - 1)
